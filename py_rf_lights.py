@@ -3,6 +3,7 @@
 import argparse
 import signal
 import time
+import json
 import sys
 import logging
 import RPi.GPIO as GPIO
@@ -29,7 +30,7 @@ TAO95 = {
   'SYNC_CODE': 'S00000000',  # special sync code
   'DEFAULT_REPEAT': 3,       # ~0.23s
   'HOLD_REPEAT': 16,         # ~1.06s
-  'COMMAND_DELAY': 0.02,     # 0.02s for repeated command interval
+  'COMMAND_DELAY': 0.15,     # repeated command interval
   'BRIGHTNESS': {
     'LOW': 25,
     'MED': 50,
@@ -58,7 +59,7 @@ TXONE = {
   'SYNC_CODE': 'S',
   'DEFAULT_REPEAT': 3,     # ~0.23s
   'POWER_REPEAT': 5,       # ~0.5s special for power command
-  'COMMAND_DELAY': 0.175,  # 0.125s for repeated command interval
+  'COMMAND_DELAY': 0.2,    # repeated command interval
   'BRIGHTNESS_TIER': [[10, 20, 30, 40, 50, 60, 70, 80, 90, 100],  # 3/6k from 100%
                       [10, 29, 39, 49, 59, 69, 79, 89, 100],  # 3/6k from 10%
                       [10, 18, 28, 38, 48, 58, 68, 78, 88, 98, 100]],  # 4k
@@ -128,12 +129,9 @@ class RecordKeeper:
   def __init__(self, host, db):
     self.influx_client = InfluxDBClient(host=host, port=8086, database=db)
 
-  def _tao95_obj(self, timestamp, power, main_power, main_brightness, main_color_temp, aux_power, aux_brightness, aux_color_temp):
+  def tao95_obj(self, timestamp, power, main_power, main_brightness, main_color_temp, aux_power, aux_brightness, aux_color_temp):
     return {
       "measurement": "tao95",
-      "tags": {
-        "light": "Tao95"
-      },
       "time": timestamp,
       "fields": {
         "power": bool(power),
@@ -146,12 +144,9 @@ class RecordKeeper:
       }
     }
 
-  def _txone_obj(self, timestamp, power, brightness, color_temp, color_cycle):
+  def txone_obj(self, timestamp, power, brightness, color_temp, color_cycle):
     return {
       "measurement": "txone",
-      "tags": {
-        "light": "Txone"
-      },
       "time": timestamp,
       "fields": {
         "power": bool(power),
@@ -163,39 +158,43 @@ class RecordKeeper:
 
   def get_tao95(self):
     query = 'SELECT * FROM "tao95" ORDER BY "time" DESC LIMIT 1;'
-    result = self.influx_client.query(query)
+    result = self.influx_client.query(query, epoch='s')
     d = next(result.get_points('tao95'))
-    re = d['power'], d['main_power'], d['main_brightness'], d['main_color_temp'], d['aux_power'], d['aux_brightness'], d['aux_color_temp']
+    re = d['time'], d['power'], d['main_power'], d['main_brightness'], d['main_color_temp'], d['aux_power'], d['aux_brightness'], d['aux_color_temp']
     LOGGER.debug("Get Tao95: %s", re)
     return re
 
   def save_tao95(self, power, main_power, main_brightness, main_color_temp, aux_power, aux_brightness, aux_color_temp):
     LOGGER.debug("Save Tao95: (%s, %s, %s, %s, %s, %s, %s)",
                  power, main_power, main_brightness, main_color_temp, aux_power, aux_brightness, aux_color_temp)
-    ts = datetime.now(timezone.utc).astimezone().isoformat()
-    return self.influx_client.write_points([self._tao95_obj(ts, power, main_power, main_brightness,
-                                                            main_color_temp, aux_power, aux_brightness, aux_color_temp)])
+    ts = int(datetime.now().timestamp())
+    obj = self.tao95_obj(ts, power, main_power, main_brightness,
+                         main_color_temp, aux_power, aux_brightness, aux_color_temp)
+    self.influx_client.write_points([obj], time_precision='s')
+    return obj
 
   def get_txone(self):
     query = 'SELECT * FROM "txone" ORDER BY "time" DESC LIMIT 1;'
-    result = self.influx_client.query(query)
+    result = self.influx_client.query(query, epoch='s')
     d = next(result.get_points('txone'))
-    re = d['power'], d['brightness'], d['color_temp'], d['color_cycle']
+    re = d['time'], d['power'], d['brightness'], d['color_temp'], d['color_cycle']
     LOGGER.debug("Get Txone: %s", re)
     return re
 
   def save_txone(self, power, brightness, color_temp, color_cycle):
     LOGGER.debug("Save Txone: (%s, %s, %s, %s)",
                  power, brightness, color_temp, color_cycle)
-    ts = datetime.now(timezone.utc).astimezone().isoformat()
-    return self.influx_client.write_points([self._txone_obj(
-      ts, power, brightness, color_temp, color_cycle)])
+    ts = int(datetime.now().timestamp())
+    obj = self.txone_obj(ts, power, brightness, color_temp, color_cycle)
+    self.influx_client.write_points([obj], time_precision='s')
+    return obj
 
 
 class Tao95Light:
   # Tao95Light: set_light, click_button, sync.
 
   def __init__(self):
+    self.last_update = None
     self.power = False
     self.main_power, self.main_brightness, self.main_color_temp = False, TAO95[
       'BRIGHTNESS']['FULL'], TAO95['COLOR_TEMPS']['WARM']
@@ -217,9 +216,9 @@ class Tao95Light:
       'BRIGHTNESS']['FULL'], TAO95['COLOR_TEMPS']['WARM']
     return self._update_db()
 
-  def set_light(self, part, power, brightness=TAO95['BRIGHTNESS']['FULL'], color_temp=TAO95['COLOR_TEMPS']['WARM']):
+  def set_light(self, part, power, brightness=-1, color_temp=-1):
     # public: set_light(part='all'|'main'|'aux', power, brightness, color_temp)
-    if brightness <= 0:
+    if brightness == 0 or brightness < -1:
       power = False
     if part == 'all':
       self._set_all(power, brightness, color_temp)
@@ -237,6 +236,11 @@ class Tao95Light:
     self._add_command(bnum, hold)
     return self._execute_commands()
 
+  def status(self):
+    return RECORDKEEPER.tao95_obj(self.last_update, self.power,
+                                  self.main_power, self.main_brightness, self.main_color_temp,
+                                  self.aux_power, self.aux_brightness, self.aux_color_temp)
+
   def _to_raw_codes(self, int_codes, length):
     r = []
     for c in int_codes:
@@ -252,7 +256,7 @@ class Tao95Light:
 
   def _execute_commands(self):
     if not len(self.command_queue):
-      return False
+      return self.status()
     while len(self.command_queue):
       (bnum, hold) = self.command_queue.pop(0)
       self._transmit_command(bnum, hold)
@@ -313,7 +317,7 @@ class Tao95Light:
     return self._step_to_color_temp(s)
 
   def _load_db(self):
-    (self.power,
+    (self.last_update, self.power,
      self.main_power, self.main_brightness, self.main_color_temp,
      self.aux_power, self.aux_brightness, self.aux_color_temp) = RECORDKEEPER.get_tao95()
     return True
@@ -334,10 +338,12 @@ class Tao95Light:
           self._add_command(1)   # then: turn on main
         else:                   # if: both main and aux are off
           self._add_command(0)   # then: turn on all
-      self._set_main_brightness(brightness)
-      self._set_main_color_temp(color_temp)
-      self._set_aux_brightness(brightness)
-      self._set_aux_color_temp(color_temp)
+      if brightness != -1:
+        self._set_main_brightness(brightness)
+        self._set_aux_brightness(brightness)
+      if color_temp != -1:
+        self._set_main_color_temp(color_temp)
+        self._set_aux_color_temp(color_temp)
     # if set all to off, ignore brightness and color_temp
     else:
       if self.main_power or self.aux_power:  # if: either main or aux is on
@@ -349,8 +355,10 @@ class Tao95Light:
     if power:
       if not self.main_power:
         self._add_command(1)
-      self._set_main_brightness(brightness)
-      self._set_main_color_temp(color_temp)
+      if brightness != -1:
+        self._set_main_brightness(brightness)
+      if color_temp != -1:
+        self._set_main_color_temp(color_temp)
     # if set main to off, ignore brightness and color_temp
     else:
       if self.main_power:
@@ -365,8 +373,10 @@ class Tao95Light:
     if power:
       if not self.aux_power:
         self._add_command(3)
-      self._set_aux_brightness(brightness)
-      self._set_aux_color_temp(color_temp)
+      if brightness != -1:
+        self._set_aux_brightness(brightness)
+      if color_temp != -1:
+        self._set_aux_color_temp(color_temp)
     # if set aux to off, ignore brightness and color_temp
     else:
       if self.aux_power:
@@ -441,6 +451,7 @@ class TxoneLight:
   # TxoneLight: set_light, click_button, sync.
 
   def __init__(self):
+    self.last_update = None
     self.power, self.brightness, self.color_temp, self.color_cycle = False, 100, TXONE[
       'COLOR_TEMPS']['WARM'], False
     self.command_queue = []
@@ -456,12 +467,12 @@ class TxoneLight:
       'COLOR_TEMPS']['WARM'], False
     return self._update_db()
 
-  def set_light(self, power, brightness=100, color_temp=TXONE['COLOR_TEMPS']['WARM']):
+  def set_light(self, power, brightness, color_temp):
     # public: set_light(power, brightness, color_temp)
-    if brightness <= 0:
+    if brightness == 0 or brightness < -1:
       power = False
-    color_temp = self._clean_ct(color_temp)
     brightness = self._clean_bn(brightness)
+    color_temp = self._clean_ct(color_temp)
     if power:
       if not self.power:
         # turn on light now
@@ -480,6 +491,10 @@ class TxoneLight:
     self._add_command(bnum, TXONE['POWER_REPEAT'] if (
       bnum == 0 or bnum == 1) else TXONE['DEFAULT_REPEAT'])
     return self._execute_commands()
+
+  def status(self):
+    return RECORDKEEPER.txone_obj(self.last_update, self.power,
+                                  self.brightness, self.color_temp, self.color_cycle)
 
   def _set_light(self, brightness, color_temp):
     if color_temp == self.color_temp:
@@ -567,7 +582,9 @@ class TxoneLight:
       return self._add_command(5)
 
   def _clean_bn(self, brightness):
-    if brightness <= 10:
+    if brightness == -1:
+      return self.brightness
+    elif brightness <= 10:
       return 10
     elif brightness >= 100:
       return 100
@@ -575,7 +592,9 @@ class TxoneLight:
       return brightness
 
   def _clean_ct(self, color_temp):
-    if color_temp > (TXONE['COLOR_TEMPS']['COOL'] + TXONE['COLOR_TEMPS']['NEUTRAL']) / 2:
+    if color_temp == -1:
+      return self.color_temp
+    elif color_temp > (TXONE['COLOR_TEMPS']['COOL'] + TXONE['COLOR_TEMPS']['NEUTRAL']) / 2:
       return TXONE['COLOR_TEMPS']['COOL']
     elif color_temp <= (TXONE['COLOR_TEMPS']['COOL'] + TXONE['COLOR_TEMPS']['NEUTRAL']) / 2 and color_temp > (TXONE['COLOR_TEMPS']['WARM'] + TXONE['COLOR_TEMPS']['NEUTRAL']) / 2:
       return TXONE['COLOR_TEMPS']['NEUTRAL']
@@ -597,7 +616,7 @@ class TxoneLight:
 
   def _execute_commands(self):
     if not len(self.command_queue):
-      return False
+      return self.status()
     while len(self.command_queue):
       (bnum, repeat) = self.command_queue.pop(0)
       self._transmit_command(bnum, repeat)
@@ -619,52 +638,58 @@ class TxoneLight:
       self.power = False
       return True
     elif bnum == 2:  # brightness +
-      t = self._get_brightness_tier(self.brightness, self.color_temp)
-      ci = self._find_closest_index(
-        TXONE['BRIGHTNESS_TIER'][t], self.brightness)
-      ni = ci + int(repeat / 3)
-      if ni >= len(TXONE['BRIGHTNESS_TIER'][t]):
-        self.brightness = 100
-      else:
-        self.brightness = TXONE['BRIGHTNESS_TIER'][t][ni]
+      if self.power:
+        t = self._get_brightness_tier(self.brightness, self.color_temp)
+        ci = self._find_closest_index(
+          TXONE['BRIGHTNESS_TIER'][t], self.brightness)
+        ni = ci + int(repeat / 3)
+        if ni >= len(TXONE['BRIGHTNESS_TIER'][t]):
+          self.brightness = 100
+        else:
+          self.brightness = TXONE['BRIGHTNESS_TIER'][t][ni]
       return True
     elif bnum == 3:  # brightness -
-      t = self._get_brightness_tier(self.brightness, self.color_temp)
-      ci = self._find_closest_index(
-        TXONE['BRIGHTNESS_TIER'][t], self.brightness)
-      ni = ci - int(repeat / 3)
-      if ni < 0:
-        self.brightness = 10
-      else:
-        self.brightness = TXONE['BRIGHTNESS_TIER'][t][ni]
+      if self.power:
+        t = self._get_brightness_tier(self.brightness, self.color_temp)
+        ci = self._find_closest_index(
+          TXONE['BRIGHTNESS_TIER'][t], self.brightness)
+        ni = ci - int(repeat / 3)
+        if ni < 0:
+          self.brightness = 10
+        else:
+          self.brightness = TXONE['BRIGHTNESS_TIER'][t][ni]
       return True
     elif bnum == 4:  # Cycle @ 10, cycle 4K->6K->3K->4K
-      self.brightness = 10
-      if self.color_cycle:
-        self.color_temp = self._get_next_color_temp(self.color_temp)
-      else:
-        self.color_cycle = True
-        self.color_temp = TXONE['COLOR_TEMPS']['NEUTRAL']
+      if self.power:
+        self.brightness = 10
+        if self.color_cycle:
+          self.color_temp = self._get_next_color_temp(self.color_temp)
+        else:
+          self.color_cycle = True
+          self.color_temp = TXONE['COLOR_TEMPS']['NEUTRAL']
       return True
     elif bnum == 5:  # 3K @ 100
-      self.brightness = 100
-      self.color_temp = TXONE['COLOR_TEMPS']['WARM']
-      self.color_cycle = False
+      if self.power:
+        self.brightness = 100
+        self.color_temp = TXONE['COLOR_TEMPS']['WARM']
+        self.color_cycle = False
       return True
     elif bnum == 6:  # 4K @ 100
-      self.brightness = 100
-      self.color_temp = TXONE['COLOR_TEMPS']['NEUTRAL']
-      self.color_cycle = False
+      if self.power:
+        self.brightness = 100
+        self.color_temp = TXONE['COLOR_TEMPS']['NEUTRAL']
+        self.color_cycle = False
       return True
     elif bnum == 7:  # 6K @ 100
-      self.brightness = 100
-      self.color_temp = TXONE['COLOR_TEMPS']['COOL']
-      self.color_cycle = False
+      if self.power:
+        self.brightness = 100
+        self.color_temp = TXONE['COLOR_TEMPS']['COOL']
+        self.color_cycle = False
       return True
     return True
 
   def _load_db(self):
-    (self.power, self.brightness, self.color_temp,
+    (self.last_update, self.power, self.brightness, self.color_temp,
      self.color_cycle) = RECORDKEEPER.get_txone()
     return True
 
@@ -690,37 +715,47 @@ parser.add_argument('--on', action='store_true')
 parser.add_argument('--off', dest='power', action='store_false')
 parser.set_defaults(power=True)
 parser.add_argument('--part', help='tao95: all, main, or aux', default='all')
-parser.add_argument('--brightness', type=int, default=100)
-parser.add_argument('--colortemp', type=int, default=3000)
+parser.add_argument('--brightness', type=int, default=-1)
+parser.add_argument('--colortemp', type=int, default=-1)
 parser.add_argument('--button', type=int, help='click button')
 parser.add_argument('--hold', action='store_true')
 parser.set_defaults(hold=False)
 parser.add_argument('--sync', action='store_true')
+parser.add_argument('--status', action='store_true')
 
 args = parser.parse_args()
 
-logging.basicConfig(level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S',
+logging.basicConfig(level=logging.CRITICAL, datefmt='%Y-%m-%d %H:%M:%S',
                     format='%(asctime)-15s - [%(levelname)s] %(module)s: %(message)s')
 TRANSMITTER = Transmitter()
 RECORDKEEPER = RecordKeeper(args.influx, args.database)
 
 signal.signal(signal.SIGINT, exithandler)
 
+
+re = {}
+
 if args.light == 'tao95':
   tao = Tao95Light()
   if args.button is not None:
-    tao.click_button(args.button, args.hold)
+    re = tao.click_button(args.button, args.hold)
   elif args.sync:
-    tao.sync()
+    re = tao.sync()
+  elif args.status:
+    re = tao.status()
   else:
-    tao.set_light(args.part, args.power, args.brightness, args.colortemp)
+    re = tao.set_light(args.part, args.power, args.brightness, args.colortemp)
 if args.light == 'txone':
   tx = TxoneLight()
   if args.button is not None:
-    tx.click_button(args.button)
+    re = tx.click_button(args.button)
   elif args.sync:
-    tx.sync()
+    re = tx.sync()
+  elif args.status:
+    re = tx.status()
   else:
-    tx.set_light(args.power, args.brightness, args.colortemp)
+    re = tx.set_light(args.power, args.brightness, args.colortemp)
+
+sys.stdout.write(json.dumps(re))
 
 LOGGER.debug("Time: %s", time.time() - start)
