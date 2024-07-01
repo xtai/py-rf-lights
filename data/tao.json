@@ -1,0 +1,18 @@
+{
+  "power": false,
+  "brightness": 100,
+  "parts": [
+    {
+      "partName": "top",
+      "power": false,
+      "brightness": 100
+    },
+    {
+      "partName": "down",
+      "power": false,
+      "brightness": 100
+    }
+  ],
+  "light": "tao",
+  "time": 1708804800
+}
