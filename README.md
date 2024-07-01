@@ -74,7 +74,7 @@ Below are three example lights with their remote controller radio wave patterns 
 
 After decoding the remote signal, we can replicate the button click. However, to make the light smart, we also need to track its status and integrate a generic interface for smart home frameworks like Homebridge. This means we have to figure out the necessary button clicks according to the light model and its current and target state, then transmit the sequences.
 
-The logic for the example lights below can be found in the `[light_name].py` files within the [light folder](https://github.com/xtai/py-rf-lights/tree/master/light).
+The logic for the example lights below can be found in the `[light_name].py` files within the [light folder](https://github.com/xtai/py-rf-lights/tree/main/light).
 
 ### Example Lights
 
